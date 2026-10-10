@@ -21,9 +21,12 @@ import {
   Battery,
   Radio,
   Share2,
-  Lock,
+  Wifi,
+  WifiOff,
+  Link2,
 } from 'lucide-react';
-import { cyberSocket, playTacticalSound } from '../services/websocket.ts';
+import { peerNode } from '../services/peerService.ts';
+import { playTacticalSound } from '../services/websocket.ts';
 import { GpsMap } from './GpsMap.tsx';
 import type { DeviceNodeData, LogEntry, GpsCoordinates } from '../types.ts';
 
@@ -36,25 +39,24 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
   onOpenNodeClient,
   onOpenGuide,
 }) => {
-  const [devices, setDevices] = useState<DeviceNodeData[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [currentFrame, setCurrentFrame] = useState<string | null>(null);
-  const [currentFps, setCurrentFps] = useState<number>(0);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [torchState, setTorchState] = useState(false);
+  const [targetNodeId, setTargetNodeId] = useState<string>('ILHAM-NODE-1');
+  const [adminPeerId, setAdminPeerId] = useState<string>('ILHAM-ADMIN-OPS');
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isCalling, setIsCalling] = useState<boolean>(false);
+  const [rtt, setRtt] = useState<number | null>(null);
+  const [torchState, setTorchState] = useState<boolean>(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
+  const [gps, setGps] = useState<GpsCoordinates | null>(null);
+  const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<Array<{ lat: number; lng: number }>>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [filterLogLevel, setFilterLogLevel] = useState<string>('all');
-  const [nightVision, setNightVision] = useState(false);
-  const [showScanlines, setShowScanlines] = useState(true);
-  const [copiedLink, setCopiedLink] = useState(false);
-  const [showPairModal, setShowPairModal] = useState(false);
-  const [targetPairCode, setTargetPairCode] = useState('ILHAM-77');
+  const [nightVision, setNightVision] = useState<boolean>(false);
+  const [showScanlines, setShowScanlines] = useState<boolean>(true);
+  const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [showPairModal, setShowPairModal] = useState<boolean>(false);
 
-  const selectedDevice = devices.find((d) => d.id === selectedDeviceId);
-
-  // Audio chirp on incoming telemetry
-  const lastPingRef = useRef<number>(0);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   const addLog = (message: string, level: LogEntry['level'] = 'info') => {
     const entry: LogEntry = {
@@ -67,210 +69,143 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
     setLogs((prev) => [entry, ...prev.slice(0, 99)]);
   };
 
-  // Connect as Admin
+  // Initialize Admin WebRTC PeerJS
   useEffect(() => {
-    cyberSocket.connect('admin', 'admin-console', {});
+    addLog('Menginisialisasi WebRTC Command Center...', 'info');
+    peerNode.initAdmin(adminPeerId);
 
-    // Immediate REST fetch for devices
-    fetch('/api/devices')
-      .then((r) => r.json())
-      .then((data) => {
-        if (Array.isArray(data.devices)) {
-          setDevices(data.devices);
-          if (data.devices.length > 0 && !selectedDeviceId) {
-            setSelectedDeviceId(data.devices[0].id);
-          }
-        }
-      })
-      .catch(() => {});
-
-    // Periodic sync poll as fallback
-    const syncInterval = setInterval(async () => {
-      try {
-        const res = await fetch('/api/devices');
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.devices)) {
-            setDevices(data.devices);
-            if (selectedDeviceId) {
-              const current = data.devices.find((d: any) => d.id === selectedDeviceId);
-              if (current) {
-                if (current.lastFrame) setCurrentFrame(current.lastFrame);
-                if (current.fps) setCurrentFps(current.fps);
-                if (typeof current.torchOn === 'boolean') setTorchState(current.torchOn);
-                if (current.facingMode) setFacingMode(current.facingMode);
-              }
-            } else if (data.devices.length > 0) {
-              setSelectedDeviceId(data.devices[0].id);
-            }
-          }
-        }
-      } catch (e) {}
-    }, 1500);
-
-    // Listen to device list & updates
-    const unsubDevices = cyberSocket.on('devices_list', (msg) => {
-      if (Array.isArray(msg.payload)) {
-        setDevices(msg.payload);
-        if (msg.payload.length > 0 && !selectedDeviceId) {
-          setSelectedDeviceId(msg.payload[0].id);
-        }
-      }
+    const unsubOpen = peerNode.on('open', (data) => {
+      setAdminPeerId(data.id);
+      addLog(`Command Center Siap (ID: ${data.id}). Menghubungkan ke ${targetNodeId}...`, 'success');
+      // Auto-connect to target node
+      handleConnectTarget(targetNodeId);
     });
 
-    const unsubAdminReg = cyberSocket.on('admin_registered', (msg) => {
-      addLog('Sistem terhubung ke Pusat Komando ILHAM CYBER-OPS', 'success');
-      if (Array.isArray(msg.payload?.devices)) {
-        setDevices(msg.payload.devices);
-        if (msg.payload.devices.length > 0) {
-          setSelectedDeviceId(msg.payload.devices[0].id);
-        }
-      }
-    });
-
-    const unsubNodeJoined = cyberSocket.on('node_joined', (msg) => {
+    const unsubConnected = peerNode.on('connected', (data) => {
+      setIsConnected(true);
+      setIsCalling(false);
       playTacticalSound('beep');
-      addLog(`Perangkat baru terdeteksi: ${msg.nodeId} (${msg.payload?.name || 'Mobile Node'})`, 'success');
-      setDevices((prev) => {
-        const filtered = prev.filter((d) => d.id !== msg.nodeId);
-        return [...filtered, msg.payload];
-      });
-      setSelectedDeviceId(msg.nodeId);
+      addLog(`BERHASIL TERHUBUNG ke ${data.peer} via WebRTC Direct Link!`, 'success');
     });
 
-    const unsubNodeTelemetry = cyberSocket.on('node_telemetry', (msg) => {
-      setDevices((prev) =>
-        prev.map((d) => {
-          if (d.id === msg.nodeId) {
-            return {
-              ...d,
-              lastPing: msg.timestamp || Date.now(),
-              gps: msg.gps || d.gps,
-              batteryLevel: msg.battery?.level ?? d.batteryLevel,
-              batteryCharging: msg.battery?.charging ?? d.batteryCharging,
-              facingMode: msg.facingMode || d.facingMode,
-              torchOn: typeof msg.torchOn === 'boolean' ? msg.torchOn : d.torchOn,
-              online: true,
-            };
+    const unsubDisconnected = peerNode.on('disconnected', (data) => {
+      setIsConnected(false);
+      addLog(`Koneksi terputus dari target node (${data.peer})`, 'warn');
+    });
+
+    const unsubStream = peerNode.on('remote_stream', (stream: MediaStream) => {
+      addLog('Menerima WebRTC HD Live Video Stream dari sasaran!', 'success');
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => {});
+      }
+    });
+
+    const unsubRtt = peerNode.on('rtt', (data) => {
+      setRtt(data.rtt);
+    });
+
+    const unsubTelemetry = peerNode.on('telemetry', (data) => {
+      if (data.facingMode) setFacingMode(data.facingMode);
+      if (typeof data.torchOn === 'boolean') setTorchState(data.torchOn);
+      if (data.battery) setBatteryLevel(data.battery.level);
+
+      if (data.gps?.lat && data.gps?.lng) {
+        setGps(data.gps);
+        setBreadcrumbs((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last || Math.abs(last.lat - data.gps.lat) > 0.00005 || Math.abs(last.lng - data.gps.lng) > 0.00005) {
+            return [...prev, { lat: data.gps.lat, lng: data.gps.lng }].slice(-50);
           }
-          return d;
-        })
-      );
-
-      // If this is the active selected device, update local states & breadcrumbs
-      if (msg.nodeId === selectedDeviceId) {
-        if (msg.gps?.lat && msg.gps?.lng) {
-          setBreadcrumbs((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || Math.abs(last.lat - msg.gps.lat) > 0.00005 || Math.abs(last.lng - msg.gps.lng) > 0.00005) {
-              return [...prev, { lat: msg.gps.lat, lng: msg.gps.lng }].slice(-50);
-            }
-            return prev;
-          });
-        }
-        if (typeof msg.torchOn === 'boolean') setTorchState(msg.torchOn);
-        if (msg.facingMode) setFacingMode(msg.facingMode);
+          return prev;
+        });
       }
     });
 
-    const unsubNodeFrame = cyberSocket.on('node_frame', (msg) => {
-      if (msg.nodeId === selectedDeviceId) {
-        setCurrentFrame(msg.image);
-        if (msg.fps) setCurrentFps(msg.fps);
-      }
-    });
-
-    const unsubNodeStatus = cyberSocket.on('node_status', (msg) => {
-      setDevices((prev) =>
-        prev.map((d) => (d.id === msg.nodeId ? { ...d, online: msg.payload?.online ?? false } : d))
-      );
-      addLog(`Status node ${msg.nodeId}: ${msg.payload?.online ? 'Online' : 'Offline'}`, 'warn');
-    });
-
-    const unsubLogs = cyberSocket.on('log', (msg) => {
-      if (msg.message) {
-        addLog(`[${msg.nodeId || 'SYSTEM'}] ${msg.message}`, msg.level || 'info');
+    const unsubLog = peerNode.on('log', (data) => {
+      if (data.message) {
+        addLog(`[TARGET] ${data.message}`, data.level || 'info');
       }
     });
 
     return () => {
-      clearInterval(syncInterval);
-      unsubDevices();
-      unsubAdminReg();
-      unsubNodeJoined();
-      unsubNodeTelemetry();
-      unsubNodeFrame();
-      unsubNodeStatus();
-      unsubLogs();
+      unsubOpen();
+      unsubConnected();
+      unsubDisconnected();
+      unsubStream();
+      unsubRtt();
+      unsubTelemetry();
+      unsubLog();
     };
-  }, [selectedDeviceId]);
+  }, []);
 
-  // Sync state when selected device changes
-  useEffect(() => {
-    if (selectedDevice) {
-      if (selectedDevice.facingMode) setFacingMode(selectedDevice.facingMode);
-      if (typeof selectedDevice.torchOn === 'boolean') setTorchState(selectedDevice.torchOn);
-      if (selectedDevice.lastFrame) setCurrentFrame(selectedDevice.lastFrame);
-      if (selectedDevice.gps) {
-        setBreadcrumbs([{ lat: selectedDevice.gps.lat, lng: selectedDevice.gps.lng }]);
-      }
-    }
-  }, [selectedDeviceId]);
+  const handleConnectTarget = (nodeIdToConnect: string) => {
+    if (!nodeIdToConnect.trim()) return;
+    setIsCalling(true);
+    addLog(`Menghubungkan WebRTC ke node sasaran: ${nodeIdToConnect}...`, 'info');
+    peerNode.connectToTarget(nodeIdToConnect.trim().toUpperCase());
+  };
 
-  // Remote Commands
+  // Remote Hardware Controls
   const handleSwitchCamera = () => {
-    if (!selectedDeviceId) return;
+    if (!isConnected) return;
     playTacticalSound('switch');
     const nextMode = facingMode === 'user' ? 'environment' : 'user';
     setFacingMode(nextMode);
 
-    cyberSocket.send({
+    peerNode.send({
       type: 'command',
-      targetId: selectedDeviceId,
       action: 'switch_camera',
       facingMode: nextMode,
     });
-    addLog(`[DISPATCH] Ganti lensa kamera target ke: ${nextMode.toUpperCase()}`, 'command');
+    addLog(`[DISPATCH] Mengirim instruksi switch kamera ke: ${nextMode.toUpperCase()}`, 'command');
   };
 
   const handleToggleTorch = () => {
-    if (!selectedDeviceId) return;
+    if (!isConnected) return;
     playTacticalSound('switch');
     const nextTorch = !torchState;
     setTorchState(nextTorch);
 
-    cyberSocket.send({
+    peerNode.send({
       type: 'command',
-      targetId: selectedDeviceId,
       action: 'toggle_torch',
       state: nextTorch,
     });
-    addLog(`[DISPATCH] Saklar lampu Flash target: ${nextTorch ? 'ON' : 'OFF'}`, 'command');
+    addLog(`[DISPATCH] Mengirim instruksi lampu Flash: ${nextTorch ? 'ON' : 'OFF'}`, 'command');
   };
 
   const handleRemoteBeep = () => {
-    if (!selectedDeviceId) return;
+    if (!isConnected) return;
     playTacticalSound('alert');
-    cyberSocket.send({
+    peerNode.send({
       type: 'command',
-      targetId: selectedDeviceId,
       action: 'beep',
     });
-    addLog(`[DISPATCH] Mengirim Beacon Audio Alert ke perangkat target`, 'command');
+    addLog('[DISPATCH] Membunyikan Beacon Audio Alert di ponsel target', 'command');
   };
 
   const handleCaptureSnapshot = () => {
-    if (!currentFrame) return;
+    if (!videoRef.current || videoRef.current.videoWidth === 0) return;
     playTacticalSound('beep');
-    const link = document.createElement('a');
-    link.href = currentFrame;
-    link.download = `ILHAM-SNAPSHOT-${selectedDeviceId}-${Date.now()}.jpg`;
-    link.click();
-    addLog(`[SNAPSHOT] Berhasil mengunduh tangkapan layar resolusi tinggi`, 'success');
+
+    const canvas = document.createElement('canvas');
+    canvas.width = videoRef.current.videoWidth;
+    canvas.height = videoRef.current.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(videoRef.current, 0, 0);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = `ILHAM-SNAPSHOT-${targetNodeId}-${Date.now()}.jpg`;
+      link.click();
+      addLog('Snapshot HD berhasil disimpan dari stream video', 'success');
+    }
   };
 
   const handleCopyNodeLink = () => {
-    const nodeUrl = `${window.location.origin}${window.location.pathname}#/node?nodeId=${targetPairCode}`;
+    const nodeUrl = `${window.location.origin}${window.location.pathname}#/node?nodeId=${targetNodeId}`;
     navigator.clipboard.writeText(nodeUrl);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
@@ -293,12 +228,21 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <span className="text-xs uppercase tracking-widest text-cyan-400 font-mono font-bold">
-                COMMAND HUB // CENTRAL CONSOLE
+                WEBRTC COMMAND HUB // CENTRAL CONSOLE
               </span>
-              <span className="inline-flex items-center gap-1.5 text-[10px] px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 font-mono">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                ACTIVE LINK
+              <span className={`inline-flex items-center gap-1.5 text-[10px] px-2 py-0.5 rounded font-mono ${
+                isConnected
+                  ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-300'
+                  : 'bg-amber-950/60 border border-amber-500/40 text-amber-300'
+              }`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+                {isConnected ? 'WEBRTC LINK ACTIVE' : 'CONNECTING...'}
               </span>
+              {rtt !== null && (
+                <span className="text-[10px] font-mono text-cyan-400 px-1.5 py-0.2 rounded bg-cyan-950/50">
+                  LATENCY: {rtt}ms
+                </span>
+              )}
             </div>
             <h1 className="text-xl md:text-2xl font-bold font-heading text-slate-100">
               ILHAM CYBER-OPS COMMAND CENTER
@@ -313,7 +257,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
             className="px-3.5 py-2 bg-[#0e1628] hover:bg-cyan-950/70 text-cyan-300 border border-cyan-700/50 rounded-lg text-xs font-mono flex items-center gap-2 transition-all active:scale-95 shadow-md"
           >
             <Share2 className="w-3.5 h-3.5" />
-            Hubungkan HP Sasaran
+            Link HP Sasaran
           </button>
 
           {onOpenNodeClient && (
@@ -322,7 +266,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
               className="px-3.5 py-2 bg-cyan-950/40 hover:bg-cyan-900/60 text-cyan-300 border border-cyan-500/50 rounded-lg text-xs font-mono flex items-center gap-2 transition-all active:scale-95"
             >
               <Smartphone className="w-3.5 h-3.5" />
-              Buka Node di Tab Ini
+              Buka Node Tab Ini
             </button>
           )}
 
@@ -331,86 +275,54 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
               onClick={onOpenGuide}
               className="px-3.5 py-2 bg-[#0e1628] hover:bg-slate-800 text-slate-300 border border-slate-700 rounded-lg text-xs font-mono transition-all"
             >
-              Panduan Pemakaian
+              Panduan
             </button>
           )}
         </div>
       </div>
 
-      {/* Target Selector & Status Strips */}
+      {/* Target Node Connection Selector */}
       <div className="bg-[#090e18] border border-cyan-800/40 rounded-xl p-4 shadow-xl">
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-3">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-xs font-mono text-cyan-400 font-semibold">
             <Radio className="w-4 h-4 animate-pulse" />
-            DAFTAR PERANGKAT SASARAN TERDETEKSI ({devices.length})
+            TARGET NODE CONNECTION
           </div>
-          <span className="text-[11px] font-mono text-slate-400">
-            PILIH PERANGKAT DI BAWAH UNTUK KONTROL TELEOPERASI
-          </span>
-        </div>
 
-        {devices.length === 0 ? (
-          <div className="p-4 bg-[#050811] rounded-lg border border-dashed border-cyan-900/40 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs font-mono text-slate-400">
-            <div className="flex items-center gap-3">
-              <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-ping" />
-              <span>Belum ada perangkat sasaran yang terhubung. Buka halaman Node di HP Anda untuk menghubungkan.</span>
-            </div>
+          <div className="flex items-center gap-2 w-full sm:w-auto font-mono text-xs">
+            <span className="text-slate-400">HUBUNGKAN KE ID:</span>
+            <input
+              type="text"
+              value={targetNodeId}
+              onChange={(e) => setTargetNodeId(e.target.value.toUpperCase())}
+              placeholder="ILHAM-NODE-1"
+              className="bg-[#040710] border border-cyan-900 focus:border-cyan-400 rounded px-2.5 py-1 text-cyan-300 font-bold uppercase w-36 text-center"
+            />
             <button
-              onClick={() => setShowPairModal(true)}
-              className="px-3 py-1.5 bg-cyan-950 text-cyan-300 border border-cyan-700/60 rounded text-xs hover:bg-cyan-900 transition-colors"
+              onClick={() => handleConnectTarget(targetNodeId)}
+              className="px-3 py-1 bg-cyan-700 hover:bg-cyan-600 text-slate-950 font-bold rounded flex items-center gap-1.5 transition-colors active:scale-95"
             >
-              Lihat Link HP →
+              <Link2 className="w-3.5 h-3.5" />
+              Sambungkan
             </button>
           </div>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-            {devices.map((dev) => {
-              const isSelected = dev.id === selectedDeviceId;
-              return (
-                <button
-                  key={dev.id}
-                  onClick={() => setSelectedDeviceId(dev.id)}
-                  className={`p-3 rounded-lg border text-left transition-all font-mono relative overflow-hidden ${
-                    isSelected
-                      ? 'bg-cyan-950/60 border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.25)]'
-                      : 'bg-[#060a14] hover:bg-[#0a101f] border-cyan-900/40 text-slate-300'
-                  }`}
-                >
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="font-bold text-slate-100 flex items-center gap-1.5">
-                      <Smartphone className="w-3.5 h-3.5 text-cyan-400" />
-                      {dev.name || dev.id}
-                    </span>
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  </div>
-                  <div className="text-[10px] text-slate-400 space-y-0.5">
-                    <div>PLATFORM: <strong className="text-slate-200">{dev.platform}</strong></div>
-                    <div>BATERAI: <strong className="text-emerald-400">{dev.batteryLevel ? `${dev.batteryLevel}%` : 'N/A'}</strong></div>
-                    <div>LENSA: <strong className="text-cyan-300">{dev.facingMode === 'user' ? 'DEPAN' : 'BELAKANG'}</strong></div>
-                  </div>
-                  {isSelected && (
-                    <div className="absolute top-0 right-0 w-2 h-2 bg-cyan-400" />
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        )}
+        </div>
       </div>
 
       {/* Main Grid: Live Feed (Left) & GPS Radar (Right) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column: Live Camera Feed & Remote Controls (7 Cols) */}
         <div className="lg:col-span-7 flex flex-col gap-4">
-          {/* Video Viewport Container */}
           <div className="bg-[#090e18] border border-cyan-800/40 rounded-xl p-4 corner-bracket shadow-2xl flex flex-col gap-3">
             {/* Viewport Top Header */}
             <div className="flex items-center justify-between text-xs font-mono">
               <div className="flex items-center gap-2 text-cyan-400 font-semibold">
                 <Camera className="w-4 h-4 text-cyan-400" />
-                <span>LIVE FEED VIEWPORT</span>
+                <span>LIVE WEBRTC VIEWPORT (30 FPS HD)</span>
                 <span className="text-slate-500">|</span>
-                <span className="text-emerald-400">{currentFps > 0 ? `${currentFps} FPS` : 'STREAM STANDBY'}</span>
+                <span className={isConnected ? 'text-emerald-400' : 'text-amber-400'}>
+                  {isConnected ? 'STREAMING REAL-TIME' : 'WAITING FOR TARGET...'}
+                </span>
               </div>
 
               {/* Viewport display filters */}
@@ -438,36 +350,45 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
               </div>
             </div>
 
-            {/* Video Canvas Box */}
+            {/* Video Canvas Box - Direct WebRTC Video Element */}
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden border border-cyan-900/60 flex items-center justify-center">
-              {currentFrame ? (
-                <img
-                  src={currentFrame}
-                  alt="Live Target Feed"
-                  className={`w-full h-full object-cover ${
-                    nightVision ? 'hue-rotate-90 contrast-150 saturate-200 brightness-110 filter' : ''
-                  }`}
-                />
-              ) : (
-                <div className="flex flex-col items-center justify-center text-center p-6 text-slate-500 font-mono">
-                  <Camera className="w-12 h-12 mb-3 stroke-[1.5] text-cyan-900" />
-                  <span className="text-sm font-semibold text-slate-400">TIDAK ADA FEED AKTIF</span>
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className={`w-full h-full object-cover ${
+                  nightVision ? 'hue-rotate-90 contrast-150 saturate-200 brightness-110 filter' : ''
+                }`}
+              />
+
+              {/* Placeholder when not streaming */}
+              {!isConnected && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6 text-slate-500 font-mono bg-black/90 z-10">
+                  <Camera className="w-12 h-12 mb-3 stroke-[1.5] text-cyan-900 animate-pulse" />
+                  <span className="text-sm font-semibold text-slate-400">MENUNGGU STREAM DARI {targetNodeId}</span>
                   <span className="text-xs text-slate-600 mt-1 max-w-xs">
-                    Pilih target atau pastikan perangkat HP sasaran telah menekan tombol "Mulai Sesi".
+                    Buka tab/HP di link sasaran lalu klik "Mulai Sesi & Izinkan Telemetri". Video 30 FPS akan langsung tayang di sini!
                   </span>
+                  <button
+                    onClick={() => handleConnectTarget(targetNodeId)}
+                    className="mt-3 px-3 py-1 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 border border-cyan-800 rounded text-xs"
+                  >
+                    Coba Sambungkan Lagi
+                  </button>
                 </div>
               )}
 
               {/* Tactical Overlays */}
-              {showScanlines && <div className="absolute inset-0 pointer-events-none scanlines opacity-40" />}
+              {showScanlines && <div className="absolute inset-0 pointer-events-none scanlines opacity-40 z-20" />}
 
               {/* HUD Reticle */}
-              <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+              <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-20">
                 <div className="w-16 h-16 border border-cyan-500/30 rounded-full flex items-center justify-center">
                   <div className="w-2 h-2 bg-cyan-400/60 rounded-full" />
                 </div>
                 <div className="absolute top-4 left-4 text-[10px] font-mono text-cyan-400 bg-black/70 px-2 py-0.5 rounded border border-cyan-500/30">
-                  REC // {selectedDeviceId || 'NO-TARGET'}
+                  TARGET: {targetNodeId}
                 </div>
                 <div className="absolute bottom-4 left-4 text-[10px] font-mono text-slate-300 bg-black/70 px-2 py-0.5 rounded border border-cyan-900/60">
                   LENSA: <span className="text-cyan-300 font-bold">{facingMode === 'user' ? 'KAMERA DEPAN' : 'KAMERA BELAKANG'}</span>
@@ -481,7 +402,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
               </div>
             </div>
 
-            {/* HARDWARE CONTROL PANEL (Controls required by brief) */}
+            {/* HARDWARE CONTROL PANEL */}
             <div className="pt-2">
               <div className="text-[11px] font-mono text-slate-400 mb-2 font-semibold flex items-center gap-1.5">
                 <Sliders className="w-3.5 h-3.5 text-cyan-400" />
@@ -492,7 +413,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
                 {/* 1. SWITCH CAMERA BUTTON */}
                 <button
                   onClick={handleSwitchCamera}
-                  disabled={!selectedDeviceId}
+                  disabled={!isConnected}
                   className="p-2.5 bg-gradient-to-r from-cyan-950/80 to-blue-950/80 hover:from-cyan-900 hover:to-blue-900 text-cyan-300 border border-cyan-600/50 rounded-lg flex flex-col items-center justify-center gap-1.5 transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shadow-md"
                 >
                   <RotateCcw className="w-4 h-4 text-cyan-400" />
@@ -505,7 +426,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
                 {/* 2. FLASH / TORCH TOGGLE BUTTON */}
                 <button
                   onClick={handleToggleTorch}
-                  disabled={!selectedDeviceId}
+                  disabled={!isConnected}
                   className={`p-2.5 rounded-lg flex flex-col items-center justify-center gap-1.5 transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shadow-md border ${
                     torchState
                       ? 'bg-amber-950/90 hover:bg-amber-900 border-amber-400 text-amber-200 shadow-[0_0_15px_rgba(245,158,11,0.4)]'
@@ -524,7 +445,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
                 {/* 3. CAPTURE SNAPSHOT BUTTON */}
                 <button
                   onClick={handleCaptureSnapshot}
-                  disabled={!currentFrame}
+                  disabled={!isConnected}
                   className="p-2.5 bg-[#0e1628] hover:bg-cyan-950/60 text-slate-300 hover:text-cyan-300 border border-cyan-700/50 rounded-lg flex flex-col items-center justify-center gap-1.5 transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shadow-md"
                 >
                   <Download className="w-4 h-4 text-emerald-400" />
@@ -535,7 +456,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
                 {/* 4. REMOTE BEACON AUDIO CHIRP BUTTON */}
                 <button
                   onClick={handleRemoteBeep}
-                  disabled={!selectedDeviceId}
+                  disabled={!isConnected}
                   className="p-2.5 bg-[#0e1628] hover:bg-rose-950/60 text-slate-300 hover:text-rose-300 border border-cyan-700/50 hover:border-rose-700/50 rounded-lg flex flex-col items-center justify-center gap-1.5 transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shadow-md"
                 >
                   <Volume2 className="w-4 h-4 text-rose-400" />
@@ -556,16 +477,16 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
                 TACTICAL GPS RADAR TRACKER
               </span>
               <span className="text-slate-400">
-                STATUS: <strong className="text-cyan-300">{selectedDevice?.gps ? 'TRACKING LIVE' : 'MENUNGGU GPS'}</strong>
+                STATUS: <strong className="text-cyan-300">{gps ? 'TRACKING LIVE' : 'MENUNGGU GPS'}</strong>
               </span>
             </div>
 
             {/* Leaflet Map Integration */}
             <div className="h-[360px] w-full rounded-lg overflow-hidden border border-cyan-900/60">
               <GpsMap
-                gps={selectedDevice?.gps}
+                gps={gps || undefined}
                 breadcrumbs={breadcrumbs}
-                nodeName={selectedDevice?.name || selectedDeviceId}
+                nodeName={targetNodeId}
                 className="w-full h-full"
               />
             </div>
@@ -575,30 +496,26 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
               <div className="bg-[#060a14] p-2 rounded border border-cyan-950">
                 <span className="text-[10px] text-slate-500 block">LATITUDE / LONGITUDE</span>
                 <span className="text-cyan-300 font-bold">
-                  {selectedDevice?.gps
-                    ? `${selectedDevice.gps.lat.toFixed(5)}, ${selectedDevice.gps.lng.toFixed(5)}`
-                    : 'N/A'}
+                  {gps ? `${gps.lat.toFixed(5)}, ${gps.lng.toFixed(5)}` : 'N/A'}
                 </span>
               </div>
               <div className="bg-[#060a14] p-2 rounded border border-cyan-950">
                 <span className="text-[10px] text-slate-500 block">RADIUS AKURASI</span>
                 <span className="text-emerald-400 font-bold">
-                  {selectedDevice?.gps?.accuracy ? `±${Math.round(selectedDevice.gps.accuracy)} meter` : 'N/A'}
+                  {gps?.accuracy ? `±${Math.round(gps.accuracy)} meter` : 'N/A'}
                 </span>
               </div>
               <div className="bg-[#060a14] p-2 rounded border border-cyan-950">
-                <span className="text-[10px] text-slate-500 block">BATERAI PERANGKAT</span>
+                <span className="text-[10px] text-slate-500 block">BATERAI SASARAN</span>
                 <span className="text-slate-200 font-bold flex items-center gap-1">
                   <Battery className="w-3.5 h-3.5 text-emerald-400" />
-                  {selectedDevice?.batteryLevel ? `${selectedDevice.batteryLevel}%` : 'N/A'}
+                  {batteryLevel !== null ? `${batteryLevel}%` : 'N/A'}
                 </span>
               </div>
               <div className="bg-[#060a14] p-2 rounded border border-cyan-950">
                 <span className="text-[10px] text-slate-500 block">POSISI TERAKHIR</span>
                 <span className="text-slate-400">
-                  {selectedDevice?.gps?.timestamp
-                    ? new Date(selectedDevice.gps.timestamp).toLocaleTimeString()
-                    : 'Belum ada data'}
+                  {gps?.timestamp ? new Date(gps.timestamp).toLocaleTimeString() : 'Belum ada data'}
                 </span>
               </div>
             </div>
@@ -702,12 +619,12 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
             </div>
 
             <p className="text-xs text-slate-300 leading-relaxed font-mono">
-              Buka browser di HP sasaran Anda lalu masukkan URL berikut (atau salin tautan langsung):
+              Buka browser di HP sasaran Anda lalu buka link di bawah ini (atau salin tautan langsung):
             </p>
 
             <div className="bg-[#050811] p-3 rounded-lg border border-cyan-900/60 flex items-center justify-between gap-2">
               <code className="text-[11px] text-cyan-300 break-all select-all font-mono">
-                {window.location.origin}{window.location.pathname}#/node?nodeId={targetPairCode}
+                {window.location.origin}{window.location.pathname}#/node?nodeId={targetNodeId}
               </code>
               <button
                 onClick={handleCopyNodeLink}
@@ -720,9 +637,9 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
 
             <div className="p-3 bg-cyan-950/20 border border-cyan-800/40 rounded-lg text-xs text-slate-400 space-y-1 font-mono">
               <div>1. Buka tautan di atas pada HP Anda.</div>
-              <div>2. Klik tombol <strong>"Mulai Sesi & Izinkan Telemetri"</strong>.</div>
-              <div>3. Setujui izin kamera dan lokasi (hanya 1x di awal).</div>
-              <div>4. Perangkat otomatis muncul di Command Center ini!</div>
+              <div>2. Tekan <strong>"Mulai Sesi & Izinkan Telemetri"</strong>.</div>
+              <div>3. Izinkan kamera & lokasi.</div>
+              <div>4. Stream video 30 FPS langsung tampil di layar ini!</div>
             </div>
 
             <div className="flex justify-end gap-2 pt-2">

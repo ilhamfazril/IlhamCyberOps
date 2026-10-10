@@ -3,7 +3,8 @@ import { AdminCommandCenter } from './components/AdminCommandCenter.tsx';
 import { DeviceNodeClient } from './components/DeviceNodeClient.tsx';
 import { DocGuideModal } from './components/DocGuideModal.tsx';
 import { AdminLoginGate } from './components/AdminLoginGate.tsx';
-import { cyberSocket, isSessionAuthorized, clearAdminSession } from './services/websocket.ts';
+import { peerNode } from './services/peerService.ts';
+import { clearAdminSession, isSessionAuthorized } from './services/websocket.ts';
 import {
   ShieldAlert,
   Smartphone,
@@ -21,7 +22,7 @@ import {
 export default function App() {
   const [currentView, setCurrentView] = useState<'admin' | 'node'>('admin');
   const [isAdminAuthorized, setIsAdminAuthorized] = useState<boolean>(() => isSessionAuthorized());
-  const [wsConnected, setWsConnected] = useState(false);
+  const [p2pConnected, setP2pConnected] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [targetNodeId, setTargetNodeId] = useState<string>('');
 
@@ -47,13 +48,14 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleRoute);
   }, []);
 
-  // Track WS connection state
+  // Track WebRTC P2P connection state
   useEffect(() => {
-    const unsub = cyberSocket.on('connection_change', (data) => {
-      setWsConnected(data.connected);
-    });
-    setWsConnected(cyberSocket.isConnected);
-    return () => unsub();
+    const unsubConn = peerNode.on('connected', () => setP2pConnected(true));
+    const unsubDisc = peerNode.on('disconnected', () => setP2pConnected(false));
+    return () => {
+      unsubConn();
+      unsubDisc();
+    };
   }, []);
 
   const switchView = (view: 'admin' | 'node') => {
@@ -121,15 +123,15 @@ export default function App() {
           {/* Right: Connection Badge, Lock/Logout & Guide */}
           <div className="flex items-center gap-2 sm:gap-3">
             <div className="flex items-center gap-1.5 text-xs font-mono">
-              {wsConnected ? (
+              {p2pConnected ? (
                 <div className="flex items-center gap-1.5 text-emerald-400 bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-500/40">
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-                  <span className="text-[11px] hidden sm:inline">LIVE LINK</span>
+                  <span className="text-[11px] hidden sm:inline">WEBRTC DIRECT</span>
                 </div>
               ) : (
                 <div className="flex items-center gap-1.5 text-amber-400 bg-amber-950/40 px-2.5 py-1 rounded border border-amber-500/40">
                   <span className="w-2 h-2 rounded-full bg-amber-400" />
-                  <span className="text-[11px] hidden sm:inline">REST/WS SYNC</span>
+                  <span className="text-[11px] hidden sm:inline">STANDBY P2P</span>
                 </div>
               )}
             </div>

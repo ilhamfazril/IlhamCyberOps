@@ -67,14 +67,14 @@ export const DocGuideModal: React.FC<DocGuideModalProps> = ({ isOpen, onClose })
         <div className="space-y-2">
           <h3 className="text-sm font-bold text-cyan-300 flex items-center gap-2 font-heading">
             <Smartphone className="w-4 h-4 text-cyan-400" />
-            2. Cara Menghubungkan HP Sasaran
+            2. Cara Menghubungkan HP Sasaran & Akses Command Center
           </h3>
           <ol className="list-decimal list-inside space-y-1 text-slate-300 leading-relaxed">
-            <li>Buka browser (Google Chrome disarankan) pada HP Anda.</li>
-            <li>Akses URL aplikasi ini dengan akhiran hash <code>#/node</code> (contoh: <code>https://domain.app/#/node</code>).</li>
-            <li>Klik tombol <strong>"MULAI SESI & IZINKAN TELEMETRI"</strong> di HP Anda.</li>
-            <li>Setujui prompt izin browser untuk Kamera dan Lokasi (GPS).</li>
-            <li>Di Laptop/PC, buka mode <strong>Command Center</strong> (<code>#/admin</code>). ID HP sasaran Anda akan otomatis muncul di daftar perangkat aktif!</li>
+            <li>Di Laptop, buka <strong>Command Center</strong> (<code>#/admin</code>) lalu masukkan Password Otorisasi: <strong className="text-cyan-400">Ilhamfazril</strong>.</li>
+            <li>Di HP, buka link aplikasi dengan akhiran <code>#/node</code> (ID bawaan: <strong className="text-cyan-400">ILHAM-NODE-1</strong>).</li>
+            <li>Di HP, klik tombol <strong>"MULAI SESI & IZINKAN TELEMETRI"</strong> dan setujui izin kamera & lokasi (hanya 1x).</li>
+            <li>Kamera HP langsung tayang di Command Center Laptop secara <em>WebRTC P2P Direct Stream (30 FPS HD)</em>.</li>
+            <li>Anda dapat langsung menekan tombol Switch Kamera, Nyalakan Flash, dan melacak GPS di peta Leaflet!</li>
           </ol>
         </div>
 

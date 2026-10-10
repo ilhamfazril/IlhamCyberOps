@@ -14,8 +14,12 @@ import {
   Power,
   Layers,
   Terminal,
+  Wifi,
+  Copy,
+  Check,
 } from 'lucide-react';
-import { cyberSocket, playTacticalSound } from '../services/websocket.ts';
+import { peerNode } from '../services/peerService.ts';
+import { playTacticalSound } from '../services/websocket.ts';
 import type { GpsCoordinates, LogEntry } from '../types.ts';
 
 interface DeviceNodeClientProps {
@@ -28,9 +32,12 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
   onSwitchToAdmin,
 }) => {
   const [nodeId, setNodeId] = useState(
-    () => initialNodeId || localStorage.getItem('ilham_node_id') || `NODE-${Math.random().toString(36).substring(2, 6).toUpperCase()}`
+    () => initialNodeId || localStorage.getItem('ilham_node_id') || 'ILHAM-NODE-1'
   );
   const [sessionActive, setSessionActive] = useState(false);
+  const [peerOnline, setPeerOnline] = useState(false);
+  const [adminConnected, setAdminConnected] = useState(false);
+  const [rtt, setRtt] = useState<number | null>(null);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
   const [torchOn, setTorchOn] = useState(false);
   const [hardwareTorchSupported, setHardwareTorchSupported] = useState(false);
@@ -41,16 +48,12 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
   const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
   const [isCharging, setIsCharging] = useState<boolean>(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [fps, setFps] = useState(8);
-  const [framesSent, setFramesSent] = useState(0);
+  const [copiedId, setCopiedId] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const frameIntervalRef = useRef<any>(null);
   const geoWatchIdRef = useRef<number | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Save nodeId
   useEffect(() => {
     localStorage.setItem('ilham_node_id', nodeId);
   }, [nodeId]);
@@ -65,12 +68,12 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
     };
     setLogs((prev) => [entry, ...prev.slice(0, 49)]);
 
-    // Send log to admin
-    cyberSocket.send({
+    // Send log to admin over P2P DataChannel
+    peerNode.send({
       type: 'log',
-      nodeId,
       level,
       message,
+      timestamp: Date.now(),
     });
   };
 
@@ -91,66 +94,74 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
     }
   }, []);
 
-  const executeCommand = async (msg: any) => {
-    addLog(`[COMMAND DITERIMA] ${msg.action?.toUpperCase()}`, 'command');
-    playTacticalSound('switch');
-
-    if (msg.action === 'switch_camera') {
-      const nextFacing = msg.facingMode || (facingMode === 'user' ? 'environment' : 'user');
-      await switchCamera(nextFacing);
-    } else if (msg.action === 'toggle_torch') {
-      const targetState = typeof msg.state === 'boolean' ? msg.state : !torchOn;
-      await setTorchState(targetState);
-    } else if (msg.action === 'beep') {
-      playTacticalSound('alert');
-      if (navigator.vibrate) {
-        navigator.vibrate([200, 100, 200, 100, 400]);
-      }
-      addLog('Admin membunyikan Beacon Audio Alert', 'warn');
-    } else if (msg.action === 'set_stream_quality') {
-      if (msg.payload?.fps) {
-        setFps(msg.payload.fps);
-        addLog(`FPS disesuaikan ke ${msg.payload.fps} FPS`, 'info');
-      }
-    }
-  };
-
-  // Handle incoming commands from Admin via WebSocket
+  // WebRTC P2P Event Listeners
   useEffect(() => {
-    const unsubCommand = cyberSocket.on('command', (msg) => {
-      executeCommand(msg);
+    const unsubOpen = peerNode.on('open', (data) => {
+      setPeerOnline(true);
+      setNodeId(data.id);
+      addLog(`WebRTC P2P Siap. ID Node: ${data.id}`, 'success');
+
+      // Attempt to ping admin if online
+      peerNode.callAdmin('ILHAM-ADMIN-OPS');
+    });
+
+    const unsubConnected = peerNode.on('connected', (data) => {
+      setAdminConnected(true);
+      playTacticalSound('beep');
+      addLog(`Pusat Komando Admin terhubung via WebRTC P2P (${data.peer})`, 'success');
+
+      // Send initial state & telemetry immediately
+      peerNode.send({
+        type: 'telemetry',
+        nodeId,
+        facingMode,
+        torchOn,
+        battery: batteryLevel ? { level: batteryLevel, charging: isCharging } : undefined,
+        gps: gps || undefined,
+        platform: navigator.userAgent.includes('Android') ? 'Android' : navigator.userAgent.includes('iPhone') ? 'iOS' : 'Web Mobile',
+      });
+    });
+
+    const unsubDisconnected = peerNode.on('disconnected', () => {
+      setAdminConnected(false);
+      addLog('Koneksi dengan Admin terputus', 'warn');
+    });
+
+    const unsubRtt = peerNode.on('rtt', (data) => {
+      setRtt(data.rtt);
+    });
+
+    // Handle Commands from Admin
+    const unsubCommand = peerNode.on('command', async (cmd) => {
+      addLog(`[COMMAND ADMIN] ${cmd.action?.toUpperCase()}`, 'command');
+      playTacticalSound('switch');
+
+      if (cmd.action === 'switch_camera') {
+        const nextFacing = cmd.facingMode || (facingMode === 'user' ? 'environment' : 'user');
+        await switchCamera(nextFacing);
+      } else if (cmd.action === 'toggle_torch') {
+        const targetState = typeof cmd.state === 'boolean' ? cmd.state : !torchOn;
+        await setTorchState(targetState);
+      } else if (cmd.action === 'beep') {
+        playTacticalSound('alert');
+        if (navigator.vibrate) {
+          navigator.vibrate([200, 100, 200, 100, 400]);
+        }
+        addLog('Admin membunyikan Beacon Audio Alert', 'warn');
+      }
     });
 
     return () => {
+      unsubOpen();
+      unsubConnected();
+      unsubDisconnected();
+      unsubRtt();
       unsubCommand();
     };
-  }, [facingMode, torchOn, nodeId]);
-
-  // REST polling for pending commands as safety net
-  useEffect(() => {
-    if (!sessionActive || !nodeId) return;
-
-    const pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/node/poll-commands?nodeId=${encodeURIComponent(nodeId)}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.commands) && data.commands.length > 0) {
-            for (const cmd of data.commands) {
-              await executeCommand(cmd);
-            }
-          }
-        }
-      } catch (err) {
-        // silent fail on network hiccups
-      }
-    }, 1000);
-
-    return () => clearInterval(pollInterval);
-  }, [sessionActive, nodeId, facingMode, torchOn]);
+  }, [facingMode, torchOn, nodeId, batteryLevel, isCharging, gps]);
 
   // Start/Switch Camera
-  const startCamera = async (mode: 'user' | 'environment') => {
+  const startCamera = async (mode: 'user' | 'environment'): Promise<MediaStream | null> => {
     setCameraError(null);
     try {
       if (streamRef.current) {
@@ -174,25 +185,31 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
 
       setFacingMode(mode);
 
-      // Check Torch capability
+      // Check hardware torch capability
       const videoTrack = stream.getVideoTracks()[0];
       const capabilities = (videoTrack.getCapabilities ? videoTrack.getCapabilities() : {}) as any;
       const hasTorch = Boolean(capabilities && capabilities.torch);
       setHardwareTorchSupported(hasTorch);
 
+      // If active WebRTC call exists, replace video track seamlessly!
+      peerNode.replaceVideoTrack(videoTrack);
+
       addLog(`Kamera aktif: ${mode === 'environment' ? 'BELAKANG (Environment)' : 'DEPAN (User)'}`, 'success');
 
       // Send telemetry update to admin
-      cyberSocket.send({
+      peerNode.send({
         type: 'telemetry',
         nodeId,
         facingMode: mode,
         torchOn: false,
       });
+
+      return stream;
     } catch (err: any) {
       console.error('Camera access error:', err);
       setCameraError(err.message || 'Gagal mengakses kamera');
       addLog(`Gagal mengakses kamera: ${err.message}`, 'error');
+      return null;
     }
   };
 
@@ -216,13 +233,13 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
         setScreenTorchActive(false);
         addLog(`Lampu Flash Hardware: ${state ? 'MENYALA' : 'MATI'}`, 'success');
       } else {
-        // Fallback: Screen Torch (Screen brightness simulation)
+        // Fallback: Screen Torch
         setScreenTorchActive(state);
         setTorchOn(state);
         addLog(`Flash Layar (Screen Strobe): ${state ? 'MENYALA' : 'MATI'} (Hardware flash tidak tersedia di lensa ini)`, 'warn');
       }
 
-      cyberSocket.send({
+      peerNode.send({
         type: 'telemetry',
         nodeId,
         torchOn: state,
@@ -255,8 +272,8 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
         };
         setGps(coords);
 
-        // Transmit coordinates to admin
-        cyberSocket.send({
+        // Transmit coordinates to admin via WebRTC DataChannel
+        peerNode.send({
           type: 'telemetry',
           nodeId,
           gps: coords,
@@ -274,84 +291,58 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
         timeout: 10000,
       }
     );
-    addLog('Pemantauan GPS Presisi Tinggi diaktifkan', 'success');
+    addLog('GPS Presisi Tinggi aktif', 'success');
   };
 
-  // Start Frame capture loop
-  const startFrameStream = () => {
-    if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-
-    if (!canvasRef.current) {
-      canvasRef.current = document.createElement('canvas');
-      canvasRef.current.width = 480;
-      canvasRef.current.height = 360;
-    }
-
-    const intervalMs = Math.round(1000 / fps);
-    frameIntervalRef.current = setInterval(() => {
-      if (!videoRef.current || !canvasRef.current || videoRef.current.readyState < 2) return;
-
-      const ctx = canvasRef.current.getContext('2d');
-      if (!ctx) return;
-
-      ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
-      const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.6);
-
-      cyberSocket.send({
-        type: 'frame',
-        nodeId,
-        image: dataUrl,
-        payload: { fps },
-      });
-
-      setFramesSent((c) => c + 1);
-    }, intervalMs);
-  };
-
-  // Main start handler
+  // Start Session
   const handleStartSession = async () => {
     setSessionActive(true);
     playTacticalSound('beep');
+    addLog('Menginisialisasi kamera dan GPS perangkat...', 'info');
 
-    // Connect to WebSocket
-    cyberSocket.connect('node', nodeId, {
-      name: `HP-${nodeId.slice(-4)}`,
-      platform: navigator.userAgent.includes('Android') ? 'Android' : navigator.userAgent.includes('iPhone') ? 'iOS' : 'Web Client',
-      facingMode,
-      battery: { level: batteryLevel, charging: isCharging },
-    });
+    // 1. Request camera
+    const stream = await startCamera(facingMode);
+    if (!stream) {
+      setSessionActive(false);
+      return;
+    }
 
-    addLog('Menghubungkan ke Pusat Komando ILHAM CYBER-OPS...', 'info');
-
-    // Request camera and GPS
-    await startCamera(facingMode);
+    // 2. Start GPS
     startGps();
-    startFrameStream();
+
+    // 3. Initialize WebRTC PeerJS
+    addLog('Membuka saluran WebRTC P2P...', 'info');
+    peerNode.initNode(nodeId, stream);
   };
 
-  // Stop handler
+  // Stop Session
   const handleStopSession = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
     if (geoWatchIdRef.current !== null) {
       navigator.geolocation.clearWatch(geoWatchIdRef.current);
       geoWatchIdRef.current = null;
     }
+    peerNode.cleanup();
     setTorchOn(false);
     setScreenTorchActive(false);
     setSessionActive(false);
+    setAdminConnected(false);
+    setPeerOnline(false);
     addLog('Sesi teleoperasi dihentikan oleh pengguna', 'warn');
+  };
+
+  const handleCopyId = () => {
+    navigator.clipboard.writeText(nodeId);
+    setCopiedId(true);
+    setTimeout(() => setCopiedId(false), 2000);
   };
 
   return (
     <div className="relative min-h-[calc(100vh-64px)] p-4 md:p-6 max-w-4xl mx-auto flex flex-col gap-6">
-      {/* Screen Torch Simulation Overlay (fills screen with 100% white max brightness) */}
+      {/* Screen Torch Simulation Overlay */}
       {screenTorchActive && (
         <div
           onClick={() => setScreenTorchActive(false)}
@@ -375,11 +366,11 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-xs uppercase tracking-widest text-cyan-500 font-mono font-semibold">
-                  FIELD EXPERIMENT NODE
+                  WEBRTC P2P TARGET NODE
                 </span>
                 <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-cyan-950/60 border border-cyan-800/50 text-cyan-300 font-mono">
-                  <span className={`w-2 h-2 rounded-full ${sessionActive ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'}`} />
-                  {sessionActive ? 'ONLINE & STREAMING' : 'STANDBY'}
+                  <span className={`w-2 h-2 rounded-full ${adminConnected ? 'bg-emerald-400 animate-ping' : peerOnline ? 'bg-amber-400' : 'bg-slate-600'}`} />
+                  {adminConnected ? 'ADMIN TERKONEKSI (P2P LIVE)' : peerOnline ? 'SIAP TERKONEKSI' : 'STANDBY'}
                 </span>
               </div>
               <h1 className="text-xl md:text-2xl font-bold font-heading text-slate-100 flex items-center gap-2">
@@ -390,14 +381,21 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
 
           <div className="flex items-center gap-2 w-full sm:w-auto">
             <div className="flex-1 sm:flex-initial flex items-center gap-2 bg-[#060a14] px-3 py-1.5 rounded border border-cyan-900/40 text-xs font-mono">
-              <span className="text-slate-500">ID:</span>
+              <span className="text-slate-500">ID NODE:</span>
               <input
                 type="text"
                 value={nodeId}
                 onChange={(e) => setNodeId(e.target.value.toUpperCase())}
                 disabled={sessionActive}
-                className="bg-transparent text-cyan-400 font-bold focus:outline-none w-28 uppercase"
+                className="bg-transparent text-cyan-400 font-bold focus:outline-none w-32 uppercase"
               />
+              <button
+                onClick={handleCopyId}
+                className="text-slate-400 hover:text-cyan-300"
+                title="Salin ID Node"
+              >
+                {copiedId ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
             </div>
           </div>
         </div>
@@ -407,12 +405,12 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
           <ShieldCheck className="w-5 h-5 text-cyan-400 shrink-0 mt-0.5" />
           <div>
             <strong className="text-cyan-300 font-semibold block mb-0.5">
-              Transparansi Akses & Izin Perangkat
+              Transparansi Akses & Izin Perangkat (WebRTC P2P)
             </strong>
-            Halaman ini bertindak sebagai perpanjangan perangkat (*Node*) untuk eksperimen teleoperasi pribadi. 
-            Saat Anda menekan tombol aktifkan, browser akan meminta izin Kamera dan GPS. 
-            Operator di Pusat Komando Admin dapat memantau feed kamera secara langsung, melacak koordinat GPS, 
-            mengubah lensa kamera depan/belakang, serta mengoperasikan saklar senter (flash).
+            Halaman ini bertindak sebagai perpanjangan perangkat (*Node*) untuk eksperimen pribadi. 
+            Saat Anda menekan tombol aktifkan, browser akan meminta izin Kamera dan GPS (hanya 1 kali). 
+            Kamera di-streaming langsung ke Command Center Admin secara *Peer-to-Peer* (tanpa melalui server ketiga). 
+            Admin dapat mengganti kamera depan/belakang dan mengoperasikan saklar senter secara otomatis.
           </div>
         </div>
       </div>
@@ -430,7 +428,7 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
             </h2>
             <p className="text-xs text-slate-400 leading-relaxed font-mono">
               Pastikan Anda menyetujui prompt izin browser untuk Kamera dan Lokasi saat memulai. 
-              Status koneksi dan telemetri akan langsung terhubung ke Pusat Komando.
+              Gunakan ID Node <strong className="text-cyan-400">{nodeId}</strong> di Command Center laptop Anda.
             </p>
           </div>
 
@@ -466,10 +464,10 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
                 className="w-full h-full object-cover"
               />
 
-              {/* Viewport Overlay */}
               <div className="absolute inset-0 pointer-events-none scanlines opacity-50" />
-              <div className="absolute top-2 left-2 text-[10px] font-mono bg-black/70 px-2 py-0.5 rounded text-emerald-400 border border-emerald-500/30">
-                LIVE FEED · {fps} FPS
+              <div className="absolute top-2 left-2 text-[10px] font-mono bg-black/70 px-2 py-0.5 rounded text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                WEBRTC HD LIVE · {rtt !== null ? `${rtt}ms` : '30 FPS'}
               </div>
 
               {torchOn && (
@@ -517,7 +515,7 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
             <div className="bg-[#0b101d] border border-cyan-800/40 rounded-xl p-4 shadow-xl">
               <h3 className="text-xs font-mono font-semibold text-cyan-400 mb-3 flex items-center gap-1.5">
                 <Radio className="w-4 h-4" />
-                STATUS TELEMETRI PERANGKAT
+                STATUS TELEMETRI PERANGKAT (WEBRTC P2P)
               </h3>
 
               <div className="grid grid-cols-2 gap-3 text-xs font-mono">
@@ -543,8 +541,10 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
                 </div>
 
                 <div className="bg-[#060a14] p-2.5 rounded border border-cyan-900/40">
-                  <span className="text-slate-500 block text-[10px]">FRAME TERKIRIM</span>
-                  <span className="text-slate-200 font-semibold">{framesSent} packet</span>
+                  <span className="text-slate-500 block text-[10px]">KONEKSI P2P</span>
+                  <span className={adminConnected ? 'text-emerald-400 font-semibold' : 'text-amber-400'}>
+                    {adminConnected ? 'TERHUBUNG KE ADMIN' : 'MENUNGGU ADMIN...'}
+                  </span>
                 </div>
 
                 <div className="bg-[#060a14] p-2.5 rounded border border-cyan-900/40">

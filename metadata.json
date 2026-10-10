@@ -1,0 +1,11 @@
+{
+  "name": "ILHAM CYBER-OPS",
+  "description": "Pusat komando teleoperasi dan pemantauan telemetri perangkat keras secara real-time dengan kamera, GPS, dan kontrol senter.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,5 +1,4 @@
-import { WebSocketServer, WebSocket } from 'ws';
-import type { IncomingMessage } from 'http';
+import { WebSocket } from 'ws';
 
 export interface DeviceNode {
   id: string;
@@ -21,6 +20,16 @@ export interface DeviceNode {
   };
   lastFrame?: string;
   fps?: number;
+  online: boolean;
+}
+
+export interface PendingCommand {
+  id: string;
+  action: string;
+  state?: boolean;
+  facingMode?: 'user' | 'environment';
+  payload?: any;
+  timestamp: number;
 }
 
 export interface WsMessage {
@@ -41,11 +50,12 @@ export interface WsMessage {
   torchOn?: boolean;
 }
 
-// In-memory hub for real-time node coordination
 class TelemetryHub {
   private devices = new Map<string, DeviceNode>();
   private sockets = new Map<WebSocket, { role: 'node' | 'admin'; id: string }>();
   private adminSockets = new Set<WebSocket>();
+  // Queue of commands for nodes (ensures delivery even if WS drops)
+  private pendingCommands = new Map<string, PendingCommand[]>();
 
   registerSocket(ws: WebSocket, role: 'node' | 'admin', id: string) {
     this.sockets.set(ws, { role, id });
@@ -54,7 +64,7 @@ class TelemetryHub {
       // Immediately send current devices list to new admin
       this.sendToSocket(ws, {
         type: 'devices_list',
-        payload: Array.from(this.devices.values()),
+        payload: this.getDevices(),
       });
     }
   }
@@ -68,8 +78,8 @@ class TelemetryHub {
     } else if (info.role === 'node') {
       const dev = this.devices.get(info.id);
       if (dev) {
+        dev.online = false;
         dev.lastPing = Date.now();
-        // Notify admins that node went offline
         this.broadcastToAdmins({
           type: 'node_status',
           nodeId: info.id,
@@ -98,18 +108,17 @@ class TelemetryHub {
             torchOn: false,
             lastPing: now,
             gps: msg.payload?.gps,
+            online: true,
           };
           this.devices.set(nodeId, nodeData);
           this.registerSocket(ws, 'node', nodeId);
 
-          // Confirm to node
           this.sendToSocket(ws, {
             type: 'registered',
             nodeId,
             payload: nodeData,
           });
 
-          // Broadcast to all admins
           this.broadcastToAdmins({
             type: 'node_joined',
             nodeId,
@@ -125,7 +134,7 @@ class TelemetryHub {
             type: 'admin_registered',
             payload: {
               adminId,
-              devices: Array.from(this.devices.values()),
+              devices: this.getDevices(),
             },
           });
           break;
@@ -133,85 +142,34 @@ class TelemetryHub {
 
         case 'telemetry': {
           if (!msg.nodeId) return;
-          const dev = this.devices.get(msg.nodeId);
-          if (dev) {
-            dev.lastPing = now;
-            if (msg.gps) dev.gps = msg.gps;
-            if (msg.battery) {
-              dev.batteryLevel = msg.battery.level;
-              dev.batteryCharging = msg.battery.charging;
-            }
-            if (msg.facingMode) dev.facingMode = msg.facingMode;
-            if (typeof msg.torchOn === 'boolean') dev.torchOn = msg.torchOn;
-          }
-
-          // Forward telemetry to admins
-          this.broadcastToAdmins({
-            type: 'node_telemetry',
-            nodeId: msg.nodeId,
+          this.updateTelemetry(msg.nodeId, {
             gps: msg.gps,
             battery: msg.battery,
             facingMode: msg.facingMode,
             torchOn: msg.torchOn,
-            timestamp: now,
           });
           break;
         }
 
         case 'frame': {
           if (!msg.nodeId || !msg.image) return;
-          const dev = this.devices.get(msg.nodeId);
-          if (dev) {
-            dev.lastPing = now;
-            dev.lastFrame = msg.image;
-            dev.fps = msg.payload?.fps || 10;
-          }
-
-          // Broadcast frame to admins
-          this.broadcastToAdmins({
-            type: 'node_frame',
-            nodeId: msg.nodeId,
-            image: msg.image,
-            fps: msg.payload?.fps,
-            timestamp: now,
-          });
+          this.updateFrame(msg.nodeId, msg.image, msg.payload?.fps);
           break;
         }
 
         case 'command': {
-          // Sent from Admin to Node
           const targetNodeId = msg.targetId || msg.nodeId;
           if (!targetNodeId) return;
-
-          // Find the socket for this node
-          let found = false;
-          for (const [s, info] of this.sockets.entries()) {
-            if (info.role === 'node' && info.id === targetNodeId) {
-              this.sendToSocket(s, {
-                type: 'command',
-                action: msg.action,
-                state: msg.state,
-                facingMode: msg.facingMode,
-                payload: msg.payload,
-                timestamp: now,
-              });
-              found = true;
-              break;
-            }
-          }
-
-          // Log command action back to admins
-          this.broadcastToAdmins({
-            type: 'log',
-            level: 'info',
-            message: `Command [${msg.action}] sent to node ${targetNodeId} (${found ? 'Delivered' : 'Offline/Not routed'})`,
-            timestamp: now,
+          this.dispatchCommand(targetNodeId, {
+            action: msg.action || '',
+            state: msg.state,
+            facingMode: msg.facingMode,
+            payload: msg.payload,
           });
           break;
         }
 
         case 'log': {
-          // Forward node logs to admins
           this.broadcastToAdmins({
             type: 'log',
             nodeId: msg.nodeId,
@@ -222,30 +180,139 @@ class TelemetryHub {
           break;
         }
 
-        case 'webrtc_signal': {
-          // Relay WebRTC signaling between admin and node
-          const targetId = msg.targetId;
-          if (!targetId) return;
-
-          for (const [s, info] of this.sockets.entries()) {
-            if (info.id === targetId) {
-              this.sendToSocket(s, {
-                type: 'webrtc_signal',
-                senderId: msg.senderId,
-                payload: msg.payload,
-              });
-              break;
-            }
-          }
-          break;
-        }
-
         default:
           break;
       }
     } catch (e) {
       console.error('Error handling WS message:', e);
     }
+  }
+
+  updateTelemetry(nodeId: string, data: { gps?: any; battery?: any; facingMode?: any; torchOn?: boolean }) {
+    const now = Date.now();
+    let dev = this.devices.get(nodeId);
+    if (!dev) {
+      dev = {
+        id: nodeId,
+        name: `HP-${nodeId.slice(-4).toUpperCase()}`,
+        platform: 'Mobile Web',
+        facingMode: data.facingMode || 'environment',
+        torchOn: Boolean(data.torchOn),
+        lastPing: now,
+        online: true,
+      };
+      this.devices.set(nodeId, dev);
+    }
+
+    dev.lastPing = now;
+    dev.online = true;
+    if (data.gps) dev.gps = data.gps;
+    if (data.battery) {
+      dev.batteryLevel = data.battery.level;
+      dev.batteryCharging = data.battery.charging;
+    }
+    if (data.facingMode) dev.facingMode = data.facingMode;
+    if (typeof data.torchOn === 'boolean') dev.torchOn = data.torchOn;
+
+    this.broadcastToAdmins({
+      type: 'node_telemetry',
+      nodeId,
+      gps: data.gps,
+      battery: data.battery,
+      facingMode: data.facingMode,
+      torchOn: data.torchOn,
+      timestamp: now,
+    });
+  }
+
+  updateFrame(nodeId: string, image: string, fps?: number) {
+    const now = Date.now();
+    let dev = this.devices.get(nodeId);
+    if (!dev) {
+      dev = {
+        id: nodeId,
+        name: `HP-${nodeId.slice(-4).toUpperCase()}`,
+        platform: 'Mobile Web',
+        facingMode: 'environment',
+        torchOn: false,
+        lastPing: now,
+        online: true,
+      };
+      this.devices.set(nodeId, dev);
+    }
+    dev.lastPing = now;
+    dev.online = true;
+    dev.lastFrame = image;
+    dev.fps = fps || 10;
+
+    this.broadcastToAdmins({
+      type: 'node_frame',
+      nodeId,
+      image,
+      fps: dev.fps,
+      timestamp: now,
+    });
+  }
+
+  dispatchCommand(nodeId: string, commandData: { action: string; state?: boolean; facingMode?: any; payload?: any }) {
+    const now = Date.now();
+    const cmd: PendingCommand = {
+      id: Math.random().toString(36).substring(2, 9),
+      action: commandData.action,
+      state: commandData.state,
+      facingMode: commandData.facingMode,
+      payload: commandData.payload,
+      timestamp: now,
+    };
+
+    // Store in pending queue
+    if (!this.pendingCommands.has(nodeId)) {
+      this.pendingCommands.set(nodeId, []);
+    }
+    this.pendingCommands.get(nodeId)!.push(cmd);
+    // Keep max 10 pending
+    if (this.pendingCommands.get(nodeId)!.length > 10) {
+      this.pendingCommands.get(nodeId)!.shift();
+    }
+
+    // Try WS push directly
+    let found = false;
+    for (const [s, info] of this.sockets.entries()) {
+      if (info.role === 'node' && info.id === nodeId) {
+        this.sendToSocket(s, {
+          type: 'command',
+          ...cmd,
+        });
+        found = true;
+        break;
+      }
+    }
+
+    // Also update dev state optimistically if possible
+    const dev = this.devices.get(nodeId);
+    if (dev) {
+      if (commandData.action === 'switch_camera' && commandData.facingMode) {
+        dev.facingMode = commandData.facingMode;
+      }
+      if (commandData.action === 'toggle_torch' && typeof commandData.state === 'boolean') {
+        dev.torchOn = commandData.state;
+      }
+    }
+
+    this.broadcastToAdmins({
+      type: 'log',
+      level: 'command',
+      message: `Perintah [${cmd.action.toUpperCase()}] dikirim ke ${nodeId} (${found ? 'Terkirim via WS' : 'Masuk Antrean REST'})`,
+      timestamp: now,
+    });
+
+    return cmd;
+  }
+
+  consumePendingCommands(nodeId: string): PendingCommand[] {
+    const queue = this.pendingCommands.get(nodeId) || [];
+    this.pendingCommands.set(nodeId, []);
+    return queue;
   }
 
   private sendToSocket(ws: WebSocket, data: any) {
@@ -264,7 +331,20 @@ class TelemetryHub {
   }
 
   getDevices(): DeviceNode[] {
+    const now = Date.now();
+    // Check timeout: if no ping within 25s, mark offline
+    for (const dev of this.devices.values()) {
+      if (now - dev.lastPing > 25000) {
+        dev.online = false;
+      } else {
+        dev.online = true;
+      }
+    }
     return Array.from(this.devices.values());
+  }
+
+  getDevice(id: string): DeviceNode | undefined {
+    return this.devices.get(id);
   }
 }
 

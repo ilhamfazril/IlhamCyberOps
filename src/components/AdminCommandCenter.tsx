@@ -71,6 +71,43 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
   useEffect(() => {
     cyberSocket.connect('admin', 'admin-console', {});
 
+    // Immediate REST fetch for devices
+    fetch('/api/devices')
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data.devices)) {
+          setDevices(data.devices);
+          if (data.devices.length > 0 && !selectedDeviceId) {
+            setSelectedDeviceId(data.devices[0].id);
+          }
+        }
+      })
+      .catch(() => {});
+
+    // Periodic sync poll as fallback
+    const syncInterval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/devices');
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.devices)) {
+            setDevices(data.devices);
+            if (selectedDeviceId) {
+              const current = data.devices.find((d: any) => d.id === selectedDeviceId);
+              if (current) {
+                if (current.lastFrame) setCurrentFrame(current.lastFrame);
+                if (current.fps) setCurrentFps(current.fps);
+                if (typeof current.torchOn === 'boolean') setTorchState(current.torchOn);
+                if (current.facingMode) setFacingMode(current.facingMode);
+              }
+            } else if (data.devices.length > 0) {
+              setSelectedDeviceId(data.devices[0].id);
+            }
+          }
+        }
+      } catch (e) {}
+    }, 1500);
+
     // Listen to device list & updates
     const unsubDevices = cyberSocket.on('devices_list', (msg) => {
       if (Array.isArray(msg.payload)) {
@@ -157,6 +194,7 @@ export const AdminCommandCenter: React.FC<AdminCommandCenterProps> = ({
     });
 
     return () => {
+      clearInterval(syncInterval);
       unsubDevices();
       unsubAdminReg();
       unsubNodeJoined();

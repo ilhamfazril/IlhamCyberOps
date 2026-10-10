@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { AdminCommandCenter } from './components/AdminCommandCenter.tsx';
 import { DeviceNodeClient } from './components/DeviceNodeClient.tsx';
 import { DocGuideModal } from './components/DocGuideModal.tsx';
-import { cyberSocket } from './services/websocket.ts';
+import { AdminLoginGate } from './components/AdminLoginGate.tsx';
+import { cyberSocket, isSessionAuthorized, clearAdminSession } from './services/websocket.ts';
 import {
   ShieldAlert,
   Smartphone,
@@ -13,10 +14,13 @@ import {
   WifiOff,
   Radio,
   ExternalLink,
+  Lock,
+  LogOut,
 } from 'lucide-react';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<'admin' | 'node'>('admin');
+  const [isAdminAuthorized, setIsAdminAuthorized] = useState<boolean>(() => isSessionAuthorized());
   const [wsConnected, setWsConnected] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [targetNodeId, setTargetNodeId] = useState<string>('');
@@ -29,7 +33,6 @@ export default function App() {
 
       if (hash.includes('/node') || search.includes('mode=node')) {
         setCurrentView('node');
-        // Check for ?nodeId= or &nodeId=
         const match = window.location.href.match(/nodeId=([^&#]+)/);
         if (match && match[1]) {
           setTargetNodeId(decodeURIComponent(match[1]));
@@ -56,6 +59,11 @@ export default function App() {
   const switchView = (view: 'admin' | 'node') => {
     window.location.hash = view === 'admin' ? '#/admin' : '#/node';
     setCurrentView(view);
+  };
+
+  const handleLogout = () => {
+    clearAdminSession();
+    setIsAdminAuthorized(false);
   };
 
   return (
@@ -110,8 +118,8 @@ export default function App() {
             </button>
           </div>
 
-          {/* Right: Connection Badge & Guide */}
-          <div className="flex items-center gap-3">
+          {/* Right: Connection Badge, Lock/Logout & Guide */}
+          <div className="flex items-center gap-2 sm:gap-3">
             <div className="flex items-center gap-1.5 text-xs font-mono">
               {wsConnected ? (
                 <div className="flex items-center gap-1.5 text-emerald-400 bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-500/40">
@@ -121,10 +129,21 @@ export default function App() {
               ) : (
                 <div className="flex items-center gap-1.5 text-amber-400 bg-amber-950/40 px-2.5 py-1 rounded border border-amber-500/40">
                   <span className="w-2 h-2 rounded-full bg-amber-400" />
-                  <span className="text-[11px] hidden sm:inline">CONNECTING</span>
+                  <span className="text-[11px] hidden sm:inline">REST/WS SYNC</span>
                 </div>
               )}
             </div>
+
+            {currentView === 'admin' && isAdminAuthorized && (
+              <button
+                onClick={handleLogout}
+                className="px-2.5 py-1 rounded text-xs font-mono text-rose-400 hover:text-rose-300 bg-rose-950/30 hover:bg-rose-950/60 border border-rose-900/60 transition-colors flex items-center gap-1.5"
+                title="Kunci Command Center"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Kunci</span>
+              </button>
+            )}
 
             <button
               onClick={() => setShowGuide(true)}
@@ -140,10 +159,14 @@ export default function App() {
       {/* Main Content View */}
       <main className="flex-1 cyber-grid relative">
         {currentView === 'admin' ? (
-          <AdminCommandCenter
-            onOpenNodeClient={() => switchView('node')}
-            onOpenGuide={() => setShowGuide(true)}
-          />
+          !isAdminAuthorized ? (
+            <AdminLoginGate onSuccess={() => setIsAdminAuthorized(true)} />
+          ) : (
+            <AdminCommandCenter
+              onOpenNodeClient={() => switchView('node')}
+              onOpenGuide={() => setShowGuide(true)}
+            />
+          )
         ) : (
           <DeviceNodeClient
             initialNodeId={targetNodeId}

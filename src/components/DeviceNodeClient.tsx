@@ -91,36 +91,63 @@ export const DeviceNodeClient: React.FC<DeviceNodeClientProps> = ({
     }
   }, []);
 
-  // Handle incoming commands from Admin
-  useEffect(() => {
-    const unsubCommand = cyberSocket.on('command', async (msg) => {
-      addLog(`[COMMAND DITERIMA] ${msg.action?.toUpperCase()}`, 'command');
-      playTacticalSound('switch');
+  const executeCommand = async (msg: any) => {
+    addLog(`[COMMAND DITERIMA] ${msg.action?.toUpperCase()}`, 'command');
+    playTacticalSound('switch');
 
-      if (msg.action === 'switch_camera') {
-        const nextFacing = msg.facingMode || (facingMode === 'user' ? 'environment' : 'user');
-        await switchCamera(nextFacing);
-      } else if (msg.action === 'toggle_torch') {
-        const targetState = typeof msg.state === 'boolean' ? msg.state : !torchOn;
-        await setTorchState(targetState);
-      } else if (msg.action === 'beep') {
-        playTacticalSound('alert');
-        if (navigator.vibrate) {
-          navigator.vibrate([200, 100, 200, 100, 400]);
-        }
-        addLog('Admin membunyikan Beacon Audio Alert', 'warn');
-      } else if (msg.action === 'set_stream_quality') {
-        if (msg.payload?.fps) {
-          setFps(msg.payload.fps);
-          addLog(`FPS disesuaikan ke ${msg.payload.fps} FPS`, 'info');
-        }
+    if (msg.action === 'switch_camera') {
+      const nextFacing = msg.facingMode || (facingMode === 'user' ? 'environment' : 'user');
+      await switchCamera(nextFacing);
+    } else if (msg.action === 'toggle_torch') {
+      const targetState = typeof msg.state === 'boolean' ? msg.state : !torchOn;
+      await setTorchState(targetState);
+    } else if (msg.action === 'beep') {
+      playTacticalSound('alert');
+      if (navigator.vibrate) {
+        navigator.vibrate([200, 100, 200, 100, 400]);
       }
+      addLog('Admin membunyikan Beacon Audio Alert', 'warn');
+    } else if (msg.action === 'set_stream_quality') {
+      if (msg.payload?.fps) {
+        setFps(msg.payload.fps);
+        addLog(`FPS disesuaikan ke ${msg.payload.fps} FPS`, 'info');
+      }
+    }
+  };
+
+  // Handle incoming commands from Admin via WebSocket
+  useEffect(() => {
+    const unsubCommand = cyberSocket.on('command', (msg) => {
+      executeCommand(msg);
     });
 
     return () => {
       unsubCommand();
     };
   }, [facingMode, torchOn, nodeId]);
+
+  // REST polling for pending commands as safety net
+  useEffect(() => {
+    if (!sessionActive || !nodeId) return;
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/node/poll-commands?nodeId=${encodeURIComponent(nodeId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.commands) && data.commands.length > 0) {
+            for (const cmd of data.commands) {
+              await executeCommand(cmd);
+            }
+          }
+        }
+      } catch (err) {
+        // silent fail on network hiccups
+      }
+    }, 1000);
+
+    return () => clearInterval(pollInterval);
+  }, [sessionActive, nodeId, facingMode, torchOn]);
 
   // Start/Switch Camera
   const startCamera = async (mode: 'user' | 'environment') => {

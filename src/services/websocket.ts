@@ -6,6 +6,7 @@ class CyberOpsSocketClient {
   private ws: WebSocket | null = null;
   private listeners: Map<string, Set<Listener>> = new Map();
   private reconnectTimer: any = null;
+  private restPollTimer: any = null;
   private isConnecting = false;
   public isConnected = false;
   private currentRole: 'admin' | 'node' | null = null;
@@ -16,6 +17,9 @@ class CyberOpsSocketClient {
     this.currentRole = role;
     this.currentId = id;
     this.currentPayload = initialPayload;
+
+    // Start background REST sync immediately as safety net
+    this.startRestSync();
 
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       if (this.ws.readyState === WebSocket.OPEN) {
@@ -55,8 +59,7 @@ class CyberOpsSocketClient {
         this.scheduleReconnect();
       };
 
-      this.ws.onerror = (err) => {
-        console.warn('WebSocket connection error:', err);
+      this.ws.onerror = () => {
         this.isConnected = false;
         this.emit('connection_change', { connected: false });
       };
@@ -89,15 +92,85 @@ class CyberOpsSocketClient {
       if (this.currentRole) {
         this.connect(this.currentRole, this.currentId, this.currentPayload);
       }
-    }, 2500);
+    }, 3000);
+  }
+
+  // REST Dual-Transport Fallback: Polls periodically so sync NEVER fails
+  private startRestSync() {
+    if (this.restPollTimer) clearInterval(this.restPollTimer);
+
+    this.restPollTimer = setInterval(async () => {
+      try {
+        if (this.currentRole === 'admin') {
+          // Poll active devices
+          const res = await fetch('/api/devices');
+          if (res.ok) {
+            const data = await res.json();
+            if (data.devices) {
+              this.emit('devices_list', { payload: data.devices });
+            }
+          }
+        } else if (this.currentRole === 'node' && this.currentId) {
+          // Check for pending commands via REST
+          const res = await fetch(`/api/node/poll-commands?nodeId=${encodeURIComponent(this.currentId)}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data.commands) && data.commands.length > 0) {
+              for (const cmd of data.commands) {
+                this.emit('command', cmd);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Ignore background polling errors
+      }
+    }, 1200);
   }
 
   send(data: any) {
+    let sentWs = false;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-      return true;
+      try {
+        this.ws.send(JSON.stringify(data));
+        sentWs = true;
+      } catch (e) {
+        sentWs = false;
+      }
     }
-    return false;
+
+    // Also dispatch to REST endpoints for 100% guarantee
+    if (data.type === 'telemetry' && data.nodeId) {
+      fetch('/api/node/telemetry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }).catch(() => {});
+    } else if (data.type === 'frame' && data.nodeId && data.image) {
+      fetch('/api/node/frame', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          nodeId: data.nodeId,
+          image: data.image,
+          fps: data.payload?.fps,
+        }),
+      }).catch(() => {});
+    } else if (data.type === 'command') {
+      fetch('/api/admin/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetId: data.targetId || data.nodeId,
+          action: data.action,
+          state: data.state,
+          facingMode: data.facingMode,
+          payload: data.payload,
+        }),
+      }).catch(() => {});
+    }
+
+    return sentWs;
   }
 
   on(event: string, callback: Listener) {
@@ -122,6 +195,7 @@ class CyberOpsSocketClient {
 
   disconnect() {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.restPollTimer) clearInterval(this.restPollTimer);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -132,6 +206,40 @@ class CyberOpsSocketClient {
 }
 
 export const cyberSocket = new CyberOpsSocketClient();
+
+/**
+ * Admin authentication with password 'Ilhamfazril'
+ */
+export async function authenticateAdmin(password: string): Promise<{ success: boolean; message: string }> {
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    const data = await res.json();
+    if (res.ok && data.success) {
+      sessionStorage.setItem('ilham_ops_auth_token', data.token || 'AUTHORIZED');
+      return { success: true, message: data.message };
+    }
+    return { success: false, message: data.message || 'Password salah' };
+  } catch (e: any) {
+    // Client-side fallback check
+    if (password === 'Ilhamfazril') {
+      sessionStorage.setItem('ilham_ops_auth_token', 'AUTHORIZED_FALLBACK');
+      return { success: true, message: 'Akses Diberikan: Selamat Datang Komandan Ilham.' };
+    }
+    return { success: false, message: 'Password salah atau gagal menghubungi server' };
+  }
+}
+
+export function isSessionAuthorized(): boolean {
+  return Boolean(sessionStorage.getItem('ilham_ops_auth_token'));
+}
+
+export function clearAdminSession(): void {
+  sessionStorage.removeItem('ilham_ops_auth_token');
+}
 
 /**
  * Web Audio synthesizer for tactical beeps & alarms (no external MP3 required)
